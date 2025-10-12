@@ -29,21 +29,17 @@ def convert_x_to_bbox(x):
     Chuyển đổi vector trạng thái thành hộp giới hạn.
     Phiên bản "bất tử": Xử lý cả trường hợp vector trạng thái đầu vào chứa NaN.
     """
-    # Lớp phòng vệ 1: Kiểm tra toàn bộ vector trạng thái đầu vào
     if np.any(np.isnan(x)):
-        return np.array([[0, 0, 0, 0]]) # Trả về hộp vô hiệu nếu trạng thái hỏng
+        return np.array([[0, 0, 0, 0]]) 
 
     s = x[2]
     r = x[3]
-
-    # Lớp phòng vệ 2: Kẹp các giá trị để đảm bảo tính vật lý
     s = max(0, s)
     r = max(1e-4, r)
 
     w = np.sqrt(s * r)
     h = s / w if w > 1e-4 else 0
 
-    # Lớp phòng vệ 3: Kiểm tra kết quả tính toán cuối cùng
     if np.isnan(w) or np.isnan(h) or np.isinf(w) or np.isinf(h):
         return np.array([[0, 0, 0, 0]])
 
@@ -102,12 +98,6 @@ class KalmanBoxTracker:
         return convert_x_to_bbox(self.kf.x)
     
 class CameraGrabber(Thread):
-    """
-    Một luồng chuyên dụng để đọc frame từ một nguồn video.
-    PHIÊN BẢN NÂNG CẤP: Tự động phát hiện nguồn là video file hay live stream.
-    - Nếu là video file: Sẽ hãm tốc độ đọc để giả lập FPS thật, tránh làm sập hệ thống.
-    - Nếu là live stream: Sẽ đọc nhanh nhất có thể và có cơ chế tự kết nối lại.
-    """
     def __init__(self, camera_id, source, input_queue, stop_event, target_fps_for_video=30, processing_width=None):
         super().__init__()
         self.daemon = True
@@ -136,13 +126,11 @@ class CameraGrabber(Thread):
             frame_delay = 1.0 / self.target_fps_for_video
 
         while not self.stop_event.is_set():
-            # Chỉ bắt đầu đếm giờ nếu là video file
             if not is_live_stream:
                 start_time = time.time()
             
             ret, frame = cap.read()
             if not ret:
-                # Logic xử lý khi kết thúc stream
                 if is_live_stream:
                     print(f"[WARNING] Mất kết nối hoặc kết thúc stream từ camera {self.camera_id}. Thử kết nối lại sau 5s...")
                     cap.release()
@@ -151,13 +139,8 @@ class CameraGrabber(Thread):
                     continue
                 else:
                     print(f"[INFO] CameraGrabber {self.camera_id}: Đã xử lý hết video file. Dừng luồng.")
-                    break # Thoát vòng lặp nếu là video file
-            if self.processing_width is not None and frame.shape[1] > self.processing_width:
-                h, w, _ = frame.shape
-                ratio = self.processing_width / w
-                new_h = int(h * ratio)
-                frame = cv2.resize(frame, (self.processing_width, new_h), interpolation=cv2.INTER_LINEAR)
-            # Đẩy frame vào hàng đợi một cách an toàn
+                    break
+
             try:
                 if self.input_queue.full():
                     self.input_queue.get_nowait() # Bỏ frame cũ nhất nếu hàng đợi đầy
@@ -204,20 +187,13 @@ class DisplayWorker(Thread):
         
         while not self.stop_event.is_set():
             try:
-                # <<< THAY ĐỔI: Nhận gói dữ liệu mới, có thêm 'finalized_vehicles' >>>
                 cam_id, frame, trackers_to_draw, proc_fps, finalized_vehicles = self.display_queue.get(timeout=1)
-
-                # <<< LOGIC MỚI: Cập nhật ảnh cuối cùng nếu có >>>
                 if finalized_vehicles:
-                    # Lấy phương tiện cuối cùng trong danh sách vừa được hoàn tất
                     last_vehicle = finalized_vehicles[-1] 
                     if 'image' in last_vehicle and last_vehicle['image'] is not None:
-                        # Lưu ảnh này vào bộ nhớ của worker
                         self.last_finalized_images[cam_id] = last_vehicle['image']
-
                 frame_counts[cam_id] += 1
                 
-                # ... (phần tính toán FPS giữ nguyên) ...
                 current_time = time.time()
                 elapsed_time = current_time - start_time
                 if elapsed_time >= 1.0:
@@ -228,7 +204,6 @@ class DisplayWorker(Thread):
                 
                 display_fps = self.fps_stats.get(cam_id, 0.0)
 
-                # Vẽ các tracker đang hoạt động (giữ nguyên)
                 for tracker in trackers_to_draw:
                     box = tracker.get_state()[0]
                     if tracker.hits >= self.min_hits_to_display and not np.any(np.isnan(box)):
@@ -239,11 +214,9 @@ class DisplayWorker(Thread):
                         cv2.rectangle(frame, pt1, pt2, color, 2)
                         cv2.putText(frame, label, (pt1[0], pt1[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                # Vẽ thông tin FPS (giữ nguyên)
                 cv2.putText(frame, f"Proc FPS: {proc_fps:.2f} (Tracking)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 cv2.putText(frame, f"System FPS: {display_fps:.2f} (Display)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                # <<< LOGIC MỚI: Vẽ ảnh thumbnail của phương tiện đã lưu >>>
                 if cam_id in self.last_finalized_images:
                     saved_img = self.last_finalized_images[cam_id]
                     
@@ -263,10 +236,7 @@ class DisplayWorker(Thread):
                             # Đặt thumbnail vào frame
                             frame[y_offset:y_offset + thumb_h, x_offset:x_offset + thumb_w] = thumbnail
                     except cv2.error:
-                        # Bỏ qua nếu ảnh bị lỗi (ví dụ: kích thước bằng 0)
                         pass
-
-                # Gửi frame cho VideoWriter (giữ nguyên)
                 if self.video_writer_queue is not None:
                     try:
                         self.video_writer_queue.put((cam_id, frame.copy()), block=False)
@@ -520,29 +490,21 @@ class YOLOv8NCNN:
         x2 = np.clip(x2, 0, orig_shape[1])
         y2 = np.clip(y2, 0, orig_shape[0])
         
-        # Chuẩn bị dữ liệu cho cv2.dnn.NMSBoxes
-        # Chuyển (x1, y1, x2, y2) thành (x, y, w, h)
         boxes_for_nms = np.column_stack([x1, y1, x2 - x1, y2 - y1]).astype(int)
-
-        # 4. SỬ DỤNG OPENCV NMS TỐI ƯU
-        # Chú ý: cv2.dnn.NMSBoxes cần boxes ở định dạng (x, y, w, h)
         keep_indices = cv2.dnn.NMSBoxes(boxes_for_nms.tolist(), confidences.tolist(), self.conf_threshold, self.iou_threshold)
-        
-        # Nếu keep_indices không rỗng, nó là một mảng 2D, cần flatten
+    
         if isinstance(keep_indices, np.ndarray):
             keep_indices = keep_indices.flatten()
-        else: # Có thể trả về tuple rỗng
+        else: 
             return []
 
-        # 5. Lọc và tạo kết quả cuối cùng
-        allowed_classes = {'bicycle', 'car', 'motorcycle', 'bus', 'truck'} # Dùng set để truy vấn nhanh hơn
+        allowed_classes = {'car', 'motorcycle', 'bus', 'truck'}
         
         results = []
         for idx in keep_indices:
             class_id = class_ids[idx]
             class_name = self.class_names[class_id]
             
-            # Lọc class và lọc lại theo ngưỡng riêng (nếu có)
             final_threshold = self.per_class_conf.get(class_name, self.conf_threshold)
 
             if class_name in allowed_classes and confidences[idx] >= final_threshold:
@@ -557,7 +519,6 @@ class YOLOv8NCNN:
         return results
 
     def detect(self, img, debug=False):
-        """Run detection on an image"""
         orig_shape = img.shape[:2]
         
         preprocessed, scale, pad_h, pad_w = self.preprocess(img)
@@ -622,13 +583,6 @@ class VideoWriterAsync:
 
 
 def calculate_iou(boxA, boxB):
-    """
-    Tính toán chỉ số Intersection over Union (IoU) giữa hai hộp bao.
-    Args:
-        boxA, boxB: Tọa độ hộp dạng [x1, y1, x2, y2]
-    Returns:
-        Giá trị IoU (float)
-    """
     # Xác định tọa độ của vùng giao nhau (intersection)
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
@@ -652,42 +606,23 @@ def calculate_iou(boxA, boxB):
 def calculate_iou_matrix(boxesA, boxesB):
     if boxesA.size == 0 or boxesB.size == 0:
         return np.empty((boxesA.shape[0], boxesB.shape[0]))
-
-    # Mở rộng chiều để tận dụng NumPy broadcasting
-    # boxesA sẽ có shape (N, 1, 4)
-    # boxesB sẽ có shape (1, M, 4)
-    # NumPy sẽ so sánh mỗi hộp trong A với mỗi hộp trong B
     boxesA = np.expand_dims(boxesA, axis=1)
     boxesB = np.expand_dims(boxesB, axis=0)
-    
-    # Xác định tọa độ của vùng giao nhau (intersection)
-    # Kết quả sẽ là một ma trận shape (N, M)
     xA = np.maximum(boxesA[..., 0], boxesB[..., 0])
     yA = np.maximum(boxesA[..., 1], boxesB[..., 1])
     xB = np.minimum(boxesA[..., 2], boxesB[..., 2])
     yB = np.minimum(boxesA[..., 3], boxesB[..., 3])
-
-    # Tính diện tích vùng giao nhau
     interArea = np.maximum(0, xB - xA) * np.maximum(0, yB - yA)
-
-    # Tính diện tích của từng hộp
     boxAArea = (boxesA[..., 2] - boxesA[..., 0]) * (boxesA[..., 3] - boxesA[..., 1])
     boxBArea = (boxesB[..., 2] - boxesB[..., 0]) * (boxesB[..., 3] - boxesB[..., 1])
     
-    # Tính IoU
     unionArea = boxAArea + boxBArea - interArea
     iou = interArea / unionArea
-    
-    # Xử lý trường hợp unionArea = 0 (tránh chia cho 0)
     iou[unionArea == 0] = 0
     
     return iou
 
 def associate_detections_to_trackers(tracked_boxes, detections_boxes, iou_threshold=0.3):
-    """
-    Liên kết detections với trackers bằng cách sử dụng ma trận IoU vector hóa và thuật toán Hungarian.
-    Phiên bản này được "bọc thép" để chống lại các giá trị đầu vào không hợp lệ.
-    """
     tracked_boxes = np.asarray(tracked_boxes)
     detections_boxes = np.asarray(detections_boxes)
 
@@ -700,13 +635,7 @@ def associate_detections_to_trackers(tracked_boxes, detections_boxes, iou_thresh
 
     iou_matrix = calculate_iou_matrix(tracked_boxes, detections_boxes)
     cost_matrix = 1 - iou_matrix
-    
-    # === LỚP PHÒNG VỆ QUAN TRỌNG NHẤT ===
-    # Nếu một tracker tạo ra dự đoán không hợp lệ (NaN), cost_matrix sẽ chứa NaN.
-    # Ta thay thế các giá trị NaN bằng 1.0 (chi phí tối đa), đảm bảo chúng không bao giờ được khớp.
     cost_matrix[np.isnan(cost_matrix)] = 1.0
-
-    # Bây giờ thuật toán Hungarian sẽ luôn an toàn để chạy
     row_ind, col_ind = linear_sum_assignment(cost_matrix)
     
     matches = []
@@ -714,7 +643,6 @@ def associate_detections_to_trackers(tracked_boxes, detections_boxes, iou_thresh
     matched_detections_indices = set()
 
     for r, c in zip(row_ind, col_ind):
-        # Chỉ giữ lại các cặp ghép có IoU > ngưỡng VÀ chi phí hợp lệ
         if iou_matrix[r, c] >= iou_threshold:
             matches.append([r, c])
             matched_trackers_indices.add(r)
@@ -729,9 +657,6 @@ def associate_detections_to_trackers(tracked_boxes, detections_boxes, iou_thresh
     return np.array(matches, dtype=int), unmatched_detections, unmatched_trackers
 
 def calculate_quality_score(frame, box, confidence):
-    """
-    Tính điểm chất lượng cho một vùng ảnh được phát hiện dựa trên nhiều yếu tố.
-    """
     x1, y1, x2, y2 = box
     if x1 >= x2 or y1 >= y2:
         return 0.0
@@ -755,16 +680,15 @@ def calculate_quality_score(frame, box, confidence):
 
     # 4. (Nâng cao) Trọng số cho độ sắc nét (chống mờ)
     crop = frame[y1:y2, x1:x2]
-    if crop.size > 0:
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-        normalized_sharpness = min(sharpness / 2000.0, 1.0) # Cần tinh chỉnh ngưỡng 2000
-        score += normalized_sharpness * 0.7
+    # if crop.size > 0:
+    #     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    #     sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+    #     normalized_sharpness = min(sharpness / 2000.0, 1.0) # Cần tinh chỉnh ngưỡng 2000
+    #     score += normalized_sharpness * 0.7
 
     return score
 
 def finalize_vehicle_data_from_tracker(tracker):
-    # Logic tương tự, nhưng lấy dữ liệu từ thuộc tính của tracker
     if not tracker.class_counts:
         return None
     final_class = max(tracker.class_counts, key=tracker.class_counts.get)
@@ -780,20 +704,16 @@ def finalize_vehicle_data_from_tracker(tracker):
     return None
 
 def save_finalized_results(finalized_vehicles, output_dir="finalized_vehicles"):
-    """
-    Lưu tất cả hình ảnh và thông tin đã được phân loại cuối cùng.
-    """
+
     if not finalized_vehicles:
         return
         
-    # print(f"\nSaving results for {len(finalized_vehicles)} finalized vehicles...")
     os.makedirs(output_dir, exist_ok=True)
     
     for vehicle in finalized_vehicles:
         file_name = f"ID_{vehicle['id']}_{vehicle['final_class']}.jpg"
         file_path = os.path.join(output_dir, file_name)
         cv2.imwrite(file_path, vehicle['image'])
-        # print(f"  - Saved: {file_name} | Details: {vehicle['class_details']}")
 
 def main(ENABLE_UI=True, SAVE_VIDEO=False,
         STATS_PRINT_INTERVAL=1.0,  PARAM_PATH=str, 
@@ -868,7 +788,7 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
             if frame_counters[cam_id] % DETECTION_INTERVAL == 0:
                 # Lấy kết quả detection
                 inference_input_queue.put((cam_id, frame))
-                processed_cam_id, _, detections = inference_output_queue.get(timeout=2)
+                processed_cam_id, _, detections = inference_output_queue.get(timeout=0.5)
                 
                 detection_boxes = [d['box'] for d in detections]
                 
@@ -924,9 +844,16 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
             
             processing_time = time.time() - start_time
             proc_fps = 1.0 / processing_time if processing_time > 0 else 0
-            
+
+            output_frame = frame.copy() 
+            if output_frame.shape[1] > PROCESSING_WIDTH:
+                h, w, _ = output_frame.shape
+                ratio = PROCESSING_WIDTH / w
+                new_h = int(h * ratio)
+                output_frame = cv2.resize(output_frame, (PROCESSING_WIDTH, new_h), interpolation=cv2.INTER_LINEAR)
+
             try:
-                display_queue.put((cam_id, frame, trackers_per_camera[cam_id], proc_fps, finalized_this_frame), timeout=1)
+                display_queue.put((cam_id, output_frame, trackers_per_camera[cam_id], proc_fps, finalized_this_frame), timeout=1)
             except queue.Full:
                 pass
 
@@ -942,10 +869,9 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
         if SAVE_VIDEO:
             if not video_writer_queue.full():
                  video_writer_queue.put(None)
-        
         for t in threads:
             t.join(timeout=5.0)
-        
+            
         print("\n--- TỔNG KẾT ---")
         print(f"Tổng số phương tiện đã được theo dõi và hoàn tất: {len(all_finalized_vehicles)}")
         save_finalized_results(all_finalized_vehicles)
@@ -954,16 +880,20 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
 
 if __name__ == "__main__":
 
+    "rtsp://admin:clbAI_2021@192.168.16.224"
+    """http://192.168.28.78:8080/14d87061586c7ce87be314ac1bf7db6e/hls/gqbb9Lhhcu/0fceca1c4aa34bd3a87853f47f841cc9/s.m3u8"""
+    """http://192.168.28.78:8080/3584d423c76ee0c27b9091351435ac4a/hls/gqbb9Lhhcu/ee79SkHP6y/s.m3u8"""
+
     # --- Cấu hình Chung ---
     ENABLE_UI = True
     STATS_PRINT_INTERVAL = 1.0
     SAVE_VIDEO = False
     # --- Cấu hình Mô hình và Nguồn Camera ---
-    PARAM_PATH = "yolo11n_ncnn_model/model.ncnn.param"
-    BIN_PATH = "yolo11n_ncnn_model/model.ncnn.bin"
+    PARAM_PATH = "models/yolo11n_ncnn_model/model.ncnn.param"
+    BIN_PATH = "models/yolo11n_ncnn_model/model.ncnn.bin"
     CAMERA_SOURCES = [
-        "tvid_shorter.mp4",
-        "4.mp4"
+        "http://192.168.28.78:8080/14d87061586c7ce87be314ac1bf7db6e/hls/gqbb9Lhhcu/0fceca1c4aa34bd3a87853f47f841cc9/s.m3u8",
+        # "assets/4.mp4"
     ]
     
     # --- Cấu hình Hiệu Năng và Tracking ---
@@ -976,7 +906,7 @@ if __name__ == "__main__":
     # --- Cấu hình Ngưỡng Tin Cậy của Model ---
     DEFAULT_CONF_THRESHOLD = 0.3
     PER_CLASS_THRESHOLDS = {
-        'bicycle': 0.55, 'car': 0.35, 'motorcycle': 0.15,
+        'car': 0.35, 'motorcycle': 0.15,
         'bus': 0.5, 'truck': 0.4, 'person':0.1
     }
     main(ENABLE_UI, SAVE_VIDEO,
