@@ -12,6 +12,41 @@ from filterpy.kalman import KalmanFilter
 from threading import Thread, Event
 from datetime import datetime
 import requests
+import yt_dlp
+import re
+
+def get_youtube_stream_url(youtube_url):
+    """
+    Sử dụng yt-dlp để lấy URL stream trực tiếp (HLS/.m3u8) từ một URL YouTube.
+    """
+    print(f"[INFO] Đang phân giải URL YouTube: {youtube_url}")
+    try:
+        # Cấu hình yt-dlp để lấy link HLS
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best', # Ưu tiên mp4, hoặc chọn best
+            'quiet': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
+            
+            # Tìm URL của stream (thường nằm trong key 'url')
+            if 'url' in info:
+                stream_url = info['url']
+                print(f"[INFO] Đã tìm thấy stream URL: {stream_url[:70]}...") # In một phần cho gọn
+                return stream_url
+            else:
+                # Đối với một số stream, cần tìm trong 'formats'
+                for f in info.get('formats', []):
+                    if f.get('url') and 'm3u8' in f.get('url', ''):
+                         stream_url = f['url']
+                         print(f"[INFO] Đã tìm thấy stream HLS URL: {stream_url[:70]}...")
+                         return stream_url
+
+        print(f"[WARNING] Không tìm thấy stream URL phù hợp cho {youtube_url}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] Lỗi khi lấy stream URL từ YouTube: {e}")
+        return None
 
 class TelegramNotifier(Thread):
     def __init__(self, notification_queue, bot_token, chat_id, stop_event):
@@ -138,6 +173,7 @@ class KalmanBoxTracker:
         self.hit_streak = 1
         self.age = 0
         self.class_name = None
+        self.confidence = 0.0
         self.color = None
         self.class_counts = defaultdict(int)
         self.best_image_info = {'score': 0.0, 'image': None}
@@ -164,14 +200,14 @@ class KalmanBoxTracker:
         return convert_x_to_bbox(self.kf.x)
     
 class CameraGrabber(Thread):
-    def __init__(self, camera_id, source, input_queue, stop_event, target_fps_for_video=30, processing_width=None):
+    def __init__(self, camera_id, source, input_queue, stop_event, default_fps=25, processing_width=None):
         super().__init__()
         self.daemon = True
         self.camera_id = camera_id
         self.source = source
         self.input_queue = input_queue
         self.stop_event = stop_event
-        self.target_fps_for_video = target_fps_for_video
+        self.default_fps = default_fps # FPS mặc định nếu không thể lấy từ video
         self.processing_width = processing_width
         print(f"[INFO] CameraGrabber {self.camera_id} đang khởi tạo cho nguồn: {self.source}")
 
@@ -181,22 +217,29 @@ class CameraGrabber(Thread):
             print(f"[ERROR] Không thể mở camera {self.camera_id} tại nguồn: {self.source}")
             return
 
-        # --- TỰ ĐỘNG PHÁT HIỆN LOẠI NGUỒN ---
-        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        is_live_stream = frame_count < 1 # Video files có frame_count > 0
-
-        if is_live_stream:
-            print(f"[INFO] CameraGrabber {self.camera_id}: Đã phát hiện LIVE STREAM.")
+        # --- LOGIC ĐỒNG BỘ HÓA MỚI ---
+        # 1. Lấy FPS từ video
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        # 2. Kiểm tra FPS có hợp lệ không. Live stream thường trả về 0.
+        if video_fps <= 0 or video_fps > 120: # Lớn hơn 120 FPS thường là lỗi
+            print(f"[WARNING] Camera {self.camera_id}: Không thể lấy FPS từ nguồn. Sử dụng FPS mặc định: {self.default_fps}")
+            target_fps = self.default_fps
         else:
-            print(f"[INFO] CameraGrabber {self.camera_id}: Đã phát hiện VIDEO FILE. Sẽ hãm tốc độ về ~{self.target_fps_for_video} FPS.")
-            frame_delay = 1.0 / self.target_fps_for_video
+            target_fps = video_fps
+            print(f"[INFO] Camera {self.camera_id}: Đã phát hiện FPS của video là {target_fps:.2f}. Sẽ đồng bộ hóa tốc độ.")
+            
+        # 3. Tính toán thời gian trễ giữa các khung hình
+        frame_delay = 1.0 / target_fps
 
         while not self.stop_event.is_set():
-            if not is_live_stream:
-                start_time = time.time()
+            # Luôn bắt đầu đo thời gian trước khi đọc frame
+            start_time = time.time()
             
             ret, frame = cap.read()
             if not ret:
+                # Logic xử lý khi mất kết nối hoặc hết video (đã tốt, giữ nguyên)
+                is_live_stream = cap.get(cv2.CAP_PROP_FRAME_COUNT) < 1
                 if is_live_stream:
                     print(f"[WARNING] Mất kết nối hoặc kết thúc stream từ camera {self.camera_id}. Thử kết nối lại sau 5s...")
                     cap.release()
@@ -209,17 +252,16 @@ class CameraGrabber(Thread):
 
             try:
                 if self.input_queue.full():
-                    self.input_queue.get_nowait() # Bỏ frame cũ nhất nếu hàng đợi đầy
+                    self.input_queue.get_nowait()
                 self.input_queue.put((self.camera_id, frame), timeout=1)
             except queue.Full:
                 continue
             
-            # Chỉ áp dụng delay hãm tốc nếu là video file
-            if not is_live_stream:
-                elapsed_time = time.time() - start_time
-                sleep_time = frame_delay - elapsed_time
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+            # --- ÁP DỤNG HÃM TỐC CHO MỌI TRƯỜNG HỢP ---
+            elapsed_time = time.time() - start_time
+            sleep_time = frame_delay - elapsed_time
+            if sleep_time > 0:
+                time.sleep(sleep_time)
         
         cap.release()
         print(f"[INFO] CameraGrabber {self.camera_id} đã dừng.")
@@ -275,7 +317,7 @@ class DisplayWorker(Thread):
                     box = tracker.get_state()[0]
                     if tracker.hits >= self.min_hits_to_display and not np.any(np.isnan(box)):
                         x1, y1, x2, y2 = box.astype(int)
-                        label = f"ID {tracker.id}: {tracker.class_name}"
+                        label = f"ID {tracker.id}: {tracker.class_name} ({tracker.confidence:.2f})"
                         pt1, pt2 = (x1, y1), (x2, y2)
                         color = tracker.color if tracker.color is not None else (0, 0, 255)
                         cv2.rectangle(frame, pt1, pt2, color, 2)
@@ -492,19 +534,22 @@ class YOLOv8NCNN:
         self.net.load_model(bin_path)
         
         # COCO class names
-        self.class_names = [
-            'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
-            'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
-            'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
-            'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
-            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
-            'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
-            'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
-            'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
-            'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
-            'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
-            'toothbrush'
-        ]
+        # self.class_names = [
+        #     'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+        #     'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+        #     'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
+        #     'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+        #     'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+        #     'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+        #     'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+        #     'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+        #     'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+        #     'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
+        #     'toothbrush'
+        # ]
+
+        self.class_names = ['bus', 'car', 'motorbike', 'truck']
+
         np.random.seed(112006) # Đảm bảo màu sắc không thay đổi mỗi lần chạy
         self.colors = [tuple(np.random.randint(0, 255, 3).tolist()) for _ in range(len(self.class_names))]
     
@@ -571,7 +616,7 @@ class YOLOv8NCNN:
         else: 
             return []
 
-        allowed_classes = {'car', 'motorcycle', 'bus', 'truck'}
+        allowed_classes = {'car', 'bus', 'truck', 'motorbike'}
         
         results = []
         for idx in keep_indices:
@@ -882,6 +927,7 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
                     tracker = current_trackers[tracker_idx]
                     
                     tracker.update(det['box'])
+                    tracker.confidence = det['confidence'] 
                     tracker.class_name = det['class_name']
                     tracker.color = model.colors[det['class_id']]
                     
@@ -900,6 +946,7 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
                 for d_idx in unmatched_dets:
                     det = detections[d_idx]
                     new_tracker = KalmanBoxTracker(det['box'])
+                    new_tracker.confidence = det['confidence']
                     new_tracker.class_name = det['class_name']
                     new_tracker.color = model.colors[det['class_id']]
                     # Cập nhật lần đầu cho tracker mới
@@ -970,14 +1017,15 @@ if __name__ == "__main__":
     STATS_PRINT_INTERVAL = 1
     SAVE_VIDEO = False
     # --- Cấu hình Mô hình và Nguồn Camera ---
-    PARAM_PATH = "models/yolo11n_ncnn_model/model.ncnn.param"
-    BIN_PATH = "models/yolo11n_ncnn_model/model.ncnn.bin"
+    PARAM_PATH = "models/best_ncnn_model/model.ncnn.param"
+    BIN_PATH = "models/best_ncnn_model/model.ncnn.bin"
     CAMERA_SOURCES = [
         # "4.mp4",
-        "http://192.168.28.78:8080/14d87061586c7ce87be314ac1bf7db6e/hls/gqbb9Lhhcu/0fceca1c4aa34bd3a87853f47f841cc9/s.m3u8",
-        # "assets/4.mp4"
+        # "https://www.youtube.com/watch?v=xCNRP131kNY",
+        # "http://192.168.28.78:8080/14d87061586c7ce87be314ac1bf7db6e/hls/gqbb9Lhhcu/0fceca1c4aa34bd3a87853f47f841cc9/s.m3u8",
+        "assets/4.mp4"
     ]
-    
+
     # --- Cấu hình Hiệu Năng và Tracking ---
     PROCESSING_WIDTH = 800
     DETECTION_INTERVAL = 3
@@ -988,9 +1036,28 @@ if __name__ == "__main__":
     # --- Cấu hình Ngưỡng Tin Cậy của Model ---
     DEFAULT_CONF_THRESHOLD = 0.3
     PER_CLASS_THRESHOLDS = {
-        'car': 0.35, 'motorcycle': 0.15,
-        'bus': 0.5, 'truck': 0.4, 'person':0.1
+        'car': 0.35, 'motorbike': 0.4,
+        'bus': 0.3, 'truck': 0.4, 'person':0.1
     }
+
+    processed_sources = []
+    print("\n[INFO] Bắt đầu xử lý danh sách nguồn camera...")
+    for source in CAMERA_SOURCES:
+        # Kiểm tra xem có phải link YouTube không
+        if "youtube.com" in source or "youtu.be" in source:
+            stream_url = get_youtube_stream_url(source)
+            if stream_url:
+                processed_sources.append(stream_url)
+            else:
+                print(f"[WARNING] Bỏ qua nguồn không hợp lệ: {source}")
+        else:
+            # Nếu không phải link YouTube, giữ nguyên
+            processed_sources.append(source)
+    
+    # Cập nhật lại CAMERA_SOURCES để chỉ chứa các link hợp lệ
+    CAMERA_SOURCES = processed_sources
+    print(f"[INFO] Đã xử lý xong. Số nguồn hợp lệ để chạy: {len(CAMERA_SOURCES)}\n")
+
     main(ENABLE_UI, SAVE_VIDEO,
         STATS_PRINT_INTERVAL, PARAM_PATH, 
         BIN_PATH, CAMERA_SOURCES, PROCESSING_WIDTH,
