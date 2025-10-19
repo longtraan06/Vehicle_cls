@@ -10,6 +10,72 @@ from threading import Thread
 from collections import defaultdict
 from filterpy.kalman import KalmanFilter
 from threading import Thread, Event
+from datetime import datetime
+import requests
+
+class TelegramNotifier(Thread):
+    def __init__(self, notification_queue, bot_token, chat_id, stop_event):
+        super().__init__()
+        self.daemon = True
+        self.notification_queue = notification_queue
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.stop_event = stop_event
+        print("[INFO] TelegramNotifier đã sẵn sàng.")
+
+    def send_notification(self, vehicle_data):
+        """Hàm gửi ảnh và thông tin phương tiện lên Telegram."""
+        try:
+            # 1. Lấy thông tin cần thiết
+            vehicle_id = vehicle_data['id']
+            vehicle_class = vehicle_data['final_class']
+            image = vehicle_data['image']
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # 2. Tạo nội dung tin nhắn (caption)
+            caption = (
+                f"✅ **Phương tiện được nhận dạng**\n\n"
+                f"🆔 **ID:** {vehicle_id}\n"
+                f"🚗 **Loại xe:** {vehicle_class}\n"
+                f"⏰ **Thời gian:** {timestamp}"
+            )
+
+            # 3. Chuẩn bị ảnh để gửi
+            # Chuyển đổi ảnh từ định dạng OpenCV (NumPy array) sang bytes JPEG
+            success, encoded_image = cv2.imencode('.jpg', image)
+            if not success:
+                print("[ERROR] Không thể encode ảnh để gửi đi Telegram.")
+                return
+            
+            image_bytes = encoded_image.tobytes()
+
+            # 4. Gửi request đến Telegram API
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendPhoto"
+            files = {'photo': ('vehicle.jpg', image_bytes, 'image/jpeg')}
+            payload = {'chat_id': self.chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
+
+            response = requests.post(url, files=files, data=payload, timeout=10) # Timeout 10s
+            
+            if response.status_code != 200:
+                print(f"[ERROR] Gửi thông báo Telegram thất bại: {response.text}")
+
+        except Exception as e:
+            print(f"[ERROR] Đã có lỗi trong luồng TelegramNotifier: {e}")
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                # Lấy dữ liệu phương tiện đã hoàn tất từ hàng đợi
+                vehicle_data = self.notification_queue.get(timeout=1)
+                
+                # Gửi thông báo
+                self.send_notification(vehicle_data)
+
+                self.notification_queue.task_done()
+            except queue.Empty:
+                continue
+        
+        print("[INFO] TelegramNotifier đã dừng.")
 
 def convert_bbox_to_z(bbox):
     """
@@ -159,23 +225,19 @@ class CameraGrabber(Thread):
         print(f"[INFO] CameraGrabber {self.camera_id} đã dừng.")
 
 # Dán đoạn mã này để thay thế hoàn toàn lớp DisplayWorker cũ
-
 class DisplayWorker(Thread):
-    """
-    Một luồng chuyên dụng để hiển thị frame (nếu UI được bật) VÀ
-    luôn tính toán FPS thông lượng cuối cùng.
-    PHIÊN BẢN NÂNG CẤP: Tự vẽ các đối tượng được theo dõi.
-    """
-    def __init__(self, display_queue, stop_event, fps_stats, ui_enabled=True, min_hits_to_display=3, video_writer_queue=None):
+    def __init__(self, display_queue, stop_event, fps_stats, ui_enabled=True, min_hits_to_display=3, video_writer_queue=None, output_width=800):
         super().__init__()
         self.daemon = True
         self.display_queue = display_queue
         self.stop_event = stop_event
         self.fps_stats = fps_stats
         self.ui_enabled = ui_enabled
-        self.min_hits_to_display = min_hits_to_display # <<< THÊM MỚI: Nhận cấu hình min_hits
+        self.min_hits_to_display = min_hits_to_display
         self.video_writer_queue = video_writer_queue
         self.last_finalized_images = {} 
+        self.output_width = output_width # <<< THÊM MỚI: Lưu lại chiều rộng mong muốn
+
     def run(self):
         if self.ui_enabled:
             print("[INFO] DisplayWorker đang chạy ở chế độ UI. Nhấn 'q' trên cửa sổ video để thoát.")
@@ -187,11 +249,15 @@ class DisplayWorker(Thread):
         
         while not self.stop_event.is_set():
             try:
+                # Nhận frame gốc (độ phân giải cao) và dữ liệu trackers
                 cam_id, frame, trackers_to_draw, proc_fps, finalized_vehicles = self.display_queue.get(timeout=1)
+
+                # --- PHẦN 1: TÍNH TOÁN VÀ VẼ LÊN FRAME GỐC (GIỮ NGUYÊN) ---
                 if finalized_vehicles:
                     last_vehicle = finalized_vehicles[-1] 
                     if 'image' in last_vehicle and last_vehicle['image'] is not None:
                         self.last_finalized_images[cam_id] = last_vehicle['image']
+                
                 frame_counts[cam_id] += 1
                 
                 current_time = time.time()
@@ -204,6 +270,7 @@ class DisplayWorker(Thread):
                 
                 display_fps = self.fps_stats.get(cam_id, 0.0)
 
+                # Vẽ tracker lên frame gốc
                 for tracker in trackers_to_draw:
                     box = tracker.get_state()[0]
                     if tracker.hits >= self.min_hits_to_display and not np.any(np.isnan(box)):
@@ -214,38 +281,35 @@ class DisplayWorker(Thread):
                         cv2.rectangle(frame, pt1, pt2, color, 2)
                         cv2.putText(frame, label, (pt1[0], pt1[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+                # Vẽ thông tin FPS lên frame gốc
                 cv2.putText(frame, f"Proc FPS: {proc_fps:.2f} (Tracking)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 cv2.putText(frame, f"System FPS: {display_fps:.2f} (Display)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
+                # Vẽ thumbnail lên frame gốc
                 if cam_id in self.last_finalized_images:
                     saved_img = self.last_finalized_images[cam_id]
-                    
-                    # Kích thước thumbnail
                     thumb_h, thumb_w = 100, 100
                     try:
                         thumbnail = cv2.resize(saved_img, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
-                        
-                        # Vị trí để vẽ thumbnail (bên dưới thông tin FPS)
-                        y_offset = 90
-                        x_offset = 10
-                        
-                        # Đảm bảo không vẽ ra ngoài khung hình
+                        y_offset, x_offset = 90, 10
                         if y_offset + thumb_h < frame.shape[0] and x_offset + thumb_w < frame.shape[1]:
-                            # Vẽ tiêu đề
                             cv2.putText(frame, "Last Vehicle Saved:", (x_offset, y_offset - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                            # Đặt thumbnail vào frame
                             frame[y_offset:y_offset + thumb_h, x_offset:x_offset + thumb_w] = thumbnail
                     except cv2.error:
                         pass
+                frame_to_output = frame
+                if frame.shape[1] > self.output_width:
+                    h, w, _ = frame.shape
+                    ratio = self.output_width / w
+                    new_h = int(h * ratio)
+                    frame_to_output = cv2.resize(frame, (self.output_width, new_h), interpolation=cv2.INTER_AREA)
                 if self.video_writer_queue is not None:
                     try:
-                        self.video_writer_queue.put((cam_id, frame.copy()), block=False)
+                        self.video_writer_queue.put((cam_id, frame_to_output.copy()), block=False)
                     except queue.Full:
                         pass
-                
-                # Hiển thị UI (giữ nguyên)
                 if self.ui_enabled:
-                    cv2.imshow(f"Camera {cam_id}", frame)
+                    cv2.imshow(f"Camera {cam_id}", frame_to_output)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         self.stop_event.set()
                         break
@@ -404,15 +468,24 @@ class VideoWriterWorker(Thread):
 # Lớp YOLOv8NCNN giữ nguyên, không cần thay đổi
 class YOLOv8NCNN:
     def __init__(self, param_path, bin_path, conf_threshold=0.25, iou_threshold=0.45, per_class_conf=None):
-        self.input_size = 640 # <<< QUAN TRỌNG: Đảm bảo kích thước này khớp với lúc bạn export model
+        self.input_size = 640 
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.per_class_conf = per_class_conf if per_class_conf is not None else {}
         self.net = ncnn.Net()
 
-        # Enable optimization for ARM CPU
-        self.net.opt.use_vulkan_compute = False
-        self.net.opt.num_threads = 4  # Adjust based on your RPi5 cores
+        # --- TỐI ƯU CHO RASPBERRY PI 5 ---
+        print("[INFO] Applying NCNN optimizations for ARM CPU...")
+        self.net.opt.use_vulkan_compute = False  # Chắc chắn dùng CPU
+        self.net.opt.use_winograd_convolution = True
+        self.net.opt.use_sgemm_convolution = True
+        # Bỏ comment dòng dưới nếu bạn đã lượng tử hóa model thành công
+        # self.net.opt.use_int8_inference = True
+        self.net.opt.use_fp16_packed = True
+        self.net.opt.use_fp16_storage = True
+        self.net.opt.use_fp16_arithmetic = True
+        self.net.opt.use_packing_layout = True
+        self.net.opt.num_threads = 3
         
         # Load model
         self.net.load_param(param_path)
@@ -720,7 +793,7 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
         BIN_PATH=str, CAMERA_SOURCES=None, PROCESSING_WIDTH=800,
         DETECTION_INTERVAL=4, IOU_THRESHOLD_TRACKING=0.3,
         MAX_AGE=15, MIN_HITS_TO_DISPLAY = 2, MIN_HITS_FOR_CLASSIFICATION = 10,
-        DEFAULT_CONF_THRESHOLD=0.3, PER_CLASS_THRESHOLDS=None):
+        DEFAULT_CONF_THRESHOLD=0.3, PER_CLASS_THRESHOLDS=None, BOT_TOKEN=None, CHAT_ID=None):
 
     print("[INFO] loading YOLO NCNN...")
     model = YOLOv8NCNN(PARAM_PATH, BIN_PATH, conf_threshold=DEFAULT_CONF_THRESHOLD, iou_threshold=0.5, per_class_conf=PER_CLASS_THRESHOLDS)
@@ -731,6 +804,7 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
     inference_output_queue = queue.Queue(maxsize=2)
     display_queue = queue.Queue(maxsize=len(CAMERA_SOURCES) * 2)
     video_writer_queue = queue.Queue(maxsize=len(CAMERA_SOURCES) * 5) if SAVE_VIDEO else None
+    notification_queue = queue.Queue(maxsize=20)
 
     stop_event = Event()
     threads = []
@@ -750,7 +824,8 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
         display_queue, stop_event, fps_stats, 
         ui_enabled=ENABLE_UI, 
         min_hits_to_display=MIN_HITS_TO_DISPLAY,
-        video_writer_queue=video_writer_queue  # <<< KẾT NỐI
+        video_writer_queue=video_writer_queue,
+        output_width=PROCESSING_WIDTH
     )
     threads.append(display_worker)
 
@@ -760,6 +835,12 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
     if SAVE_VIDEO:
         video_writer_worker = VideoWriterWorker(video_writer_queue, stop_event, fps=20.0)
         threads.append(video_writer_worker)
+
+    if BOT_TOKEN != "YOUR_BOT_TOKEN" and CHAT_ID != "YOUR_CHAT_ID":
+        telegram_worker = TelegramNotifier(notification_queue, BOT_TOKEN, CHAT_ID, stop_event)
+        threads.append(telegram_worker)
+    else:
+        print("[WARNING] BOT_TOKEN và CHAT_ID chưa được cấu hình. Luồng Telegram sẽ không chạy.")
 
     print(f"[INFO] run {len(threads)} thread...")
     for t in threads:
@@ -838,6 +919,11 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
                             if final_data:
                                 finalized_this_frame.append(final_data)
                                 all_finalized_vehicles.append(final_data)
+                                try:
+                                    notification_queue.put(final_data, block=False)
+                                except queue.Full:
+                                    print("[WARNING] Hàng đợi thông báo Telegram bị đầy, bỏ qua thông báo.")
+                                    pass
                 trackers_per_camera[cam_id] = next_frame_trackers
                 if finalized_this_frame:
                     save_finalized_results(finalized_this_frame)
@@ -845,15 +931,8 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
             processing_time = time.time() - start_time
             proc_fps = 1.0 / processing_time if processing_time > 0 else 0
 
-            output_frame = frame.copy() 
-            if output_frame.shape[1] > PROCESSING_WIDTH:
-                h, w, _ = output_frame.shape
-                ratio = PROCESSING_WIDTH / w
-                new_h = int(h * ratio)
-                output_frame = cv2.resize(output_frame, (PROCESSING_WIDTH, new_h), interpolation=cv2.INTER_LINEAR)
-
             try:
-                display_queue.put((cam_id, output_frame, trackers_per_camera[cam_id], proc_fps, finalized_this_frame), timeout=1)
+                display_queue.put((cam_id, frame, trackers_per_camera[cam_id], proc_fps, finalized_this_frame), timeout=1)
             except queue.Full:
                 pass
 
@@ -871,7 +950,7 @@ def main(ENABLE_UI=True, SAVE_VIDEO=False,
                  video_writer_queue.put(None)
         for t in threads:
             t.join(timeout=5.0)
-            
+
         print("\n--- TỔNG KẾT ---")
         print(f"Tổng số phương tiện đã được theo dõi và hoàn tất: {len(all_finalized_vehicles)}")
         save_finalized_results(all_finalized_vehicles)
@@ -884,23 +963,26 @@ if __name__ == "__main__":
     """http://192.168.28.78:8080/14d87061586c7ce87be314ac1bf7db6e/hls/gqbb9Lhhcu/0fceca1c4aa34bd3a87853f47f841cc9/s.m3u8"""
     """http://192.168.28.78:8080/3584d423c76ee0c27b9091351435ac4a/hls/gqbb9Lhhcu/ee79SkHP6y/s.m3u8"""
 
+    BOT_TOKEN="7706726930:AAE0gDgfaNIHvkoZzqNrIMAuZrp9dTuw8KA"
+    CHAT_ID="7787124769"
     # --- Cấu hình Chung ---
     ENABLE_UI = True
-    STATS_PRINT_INTERVAL = 1.0
+    STATS_PRINT_INTERVAL = 1
     SAVE_VIDEO = False
     # --- Cấu hình Mô hình và Nguồn Camera ---
     PARAM_PATH = "models/yolo11n_ncnn_model/model.ncnn.param"
     BIN_PATH = "models/yolo11n_ncnn_model/model.ncnn.bin"
     CAMERA_SOURCES = [
+        # "4.mp4",
         "http://192.168.28.78:8080/14d87061586c7ce87be314ac1bf7db6e/hls/gqbb9Lhhcu/0fceca1c4aa34bd3a87853f47f841cc9/s.m3u8",
         # "assets/4.mp4"
     ]
     
     # --- Cấu hình Hiệu Năng và Tracking ---
     PROCESSING_WIDTH = 800
-    DETECTION_INTERVAL = 4
+    DETECTION_INTERVAL = 3
     IOU_THRESHOLD_TRACKING = 0.3    
-    MAX_AGE = 15           
+    MAX_AGE = 10        
     MIN_HITS_TO_DISPLAY = 2     
     MIN_HITS_FOR_CLASSIFICATION = 10
     # --- Cấu hình Ngưỡng Tin Cậy của Model ---
@@ -914,4 +996,4 @@ if __name__ == "__main__":
         BIN_PATH, CAMERA_SOURCES, PROCESSING_WIDTH,
         DETECTION_INTERVAL, IOU_THRESHOLD_TRACKING,
         MAX_AGE, MIN_HITS_TO_DISPLAY, MIN_HITS_FOR_CLASSIFICATION,
-        DEFAULT_CONF_THRESHOLD, PER_CLASS_THRESHOLDS)
+        DEFAULT_CONF_THRESHOLD, PER_CLASS_THRESHOLDS, BOT_TOKEN, CHAT_ID)
